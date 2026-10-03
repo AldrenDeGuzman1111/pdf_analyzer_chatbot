@@ -7,6 +7,7 @@ relevant document excerpts.
 
 import hashlib
 import io
+import logging
 import os
 from typing import Any
 
@@ -43,6 +44,33 @@ SUMMARY_INSTRUCTIONS = {
     "Executive": "Write an executive summary for a decision-maker: purpose, major findings, implications, risks, and recommendations.",
     "Detailed": "Write a structured, thorough summary that covers the document's important sections, reasoning, facts, and conclusions.",
 }
+
+logger = logging.getLogger("pdf_analyzer")
+INDEX_CACHE: dict[str, tuple[list[Document], FAISS, int]] = {}
+
+
+def configure_logging() -> None:
+    if logger.handlers:
+        return
+
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+
+def get_cached_index(pdf_bytes: bytes, filename: str, api_key: str) -> tuple[list[Document], FAISS, int]:
+    digest = hashlib.sha256(pdf_bytes).hexdigest()
+    if digest in INDEX_CACHE:
+        logger.info("Using cached document index for %s", filename)
+        return INDEX_CACHE[digest]
+
+    logger.info("Building document index for %s", filename)
+    chunks, vector_store, page_count = build_index(pdf_bytes, filename, api_key)
+    INDEX_CACHE[digest] = (chunks, vector_store, page_count)
+    logger.info("Stored document index for %s in cache", filename)
+    return chunks, vector_store, page_count
 
 
 def initialize_session() -> None:
@@ -131,6 +159,7 @@ def get_openai_api_key() -> str | None:
     try:
         return st.secrets.get("OPENAI_API_KEY")
     except FileNotFoundError:
+        logger.warning("OPENAI_API_KEY missing from environment and Streamlit secrets.")
         return None
 
 
@@ -308,7 +337,9 @@ QUESTION: {question}"""
 def main() -> None:
     # Load environment variables from a local .env file (if present) before
     # checking for the OpenAI key and initializing the Streamlit UI.
+    configure_logging()
     load_dotenv()
+    logger.info("Starting PDF Analyzer application")
     st.set_page_config(page_title="PDF Analyzer", page_icon="PDF", layout="wide")
     initialize_session()
 
@@ -357,6 +388,7 @@ def main() -> None:
     if uploaded_files:
         for uploaded_file in uploaded_files:
             if uploaded_file.size > MAX_UPLOAD_BYTES:
+                logger.error("Upload rejected because '%s' is larger than %s bytes", uploaded_file.name, MAX_UPLOAD_BYTES)
                 st.error(f"The PDF '{uploaded_file.name}' exceeds the 200 MB upload limit.")
                 continue
 
@@ -373,11 +405,13 @@ def main() -> None:
 
             if existing_document_index is not None:
                 active_document_index = existing_document_index
+                logger.info("Reusing already indexed document for %s", uploaded_file.name)
             else:
                 with st.spinner(f"Extracting text and building the in-memory search index for {uploaded_file.name}..."):
                     try:
-                        chunks, vector_store, page_count = build_index(pdf_bytes, uploaded_file.name, api_key)
+                        chunks, vector_store, page_count = get_cached_index(pdf_bytes, uploaded_file.name, api_key)
                     except Exception as error:
+                        logger.exception("Could not process PDF '%s'", uploaded_file.name)
                         st.error(f"Could not process '{uploaded_file.name}': {error}")
                         continue
 
@@ -416,10 +450,12 @@ def main() -> None:
         if st.button("Summarise this document", type="primary"):
             with st.spinner("Creating the summary..."):
                 try:
+                    logger.info("Generating summary for %s using %s format", active_document["name"], style)
                     active_document["summary"] = create_summary(active_document["chunks"], style, api_key)
                     active_document["summary_style"] = style
                     sync_active_document_state(active_document)
                 except Exception as error:
+                    logger.exception("Summary generation failed for %s", active_document["name"])
                     st.error(f"Could not generate the summary: {error}")
         if active_document.get("summary"):
             st.subheader(f"{active_document['summary_style']} summary")
@@ -439,8 +475,10 @@ def main() -> None:
             with st.chat_message("assistant"):
                 with st.spinner("Searching the PDF..."):
                     try:
+                        logger.info("Answering question for %s: %s", active_document["name"], question)
                         answer, _ = answer_question(question, api_key)
                     except Exception as error:
+                        logger.exception("Question failed for %s", active_document["name"])
                         answer = f"I could not answer that question: {error}"
                     st.markdown(answer)
             active_document["messages"].append({"role": "assistant", "content": answer})

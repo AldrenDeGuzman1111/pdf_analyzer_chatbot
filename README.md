@@ -11,6 +11,8 @@ The application retains the uploaded document, extracted chunks, FAISS index, su
 - Ask follow-up questions using the recent conversation context
 - Get page-number citations in answers and summaries
 - Summarise the currently selected document with a dedicated button
+- Reuse cached PDF indexes to reduce repeated processing work
+- Log key runtime events and display clear errors to the user
 
 ## Setup
 
